@@ -34,7 +34,7 @@ BUILTIN = (
     Provider("anthropic", "ANTHROPIC_API_KEY", ("api.anthropic.com",), ("claude", "anthropic"),
              "Anthropic API key"),
     Provider("github", "GH_TOKEN", ("api.github.com",), ("github",),
-             "GitHub token", command="gh auth token"),
+             "GitHub token"),
     Provider("openai", "OPENAI_API_KEY", ("api.openai.com",), ("openai",), "OpenAI API key"),
     Provider("openrouter", "OPENROUTER_API_KEY", ("openrouter.ai",), ("openrouter",),
              "OpenRouter API key"),
@@ -126,6 +126,19 @@ def _resolve(name: str, env: str, command: str, store: dict[str, str]) -> tuple[
     return None
 
 
+def _resolve_provider(provider: Provider, project: Project, store: dict[str, str]) -> tuple[str, str] | None:
+    if provider.name != "github":
+        return _resolve(provider.name, provider.env, provider.command, store)
+    # A GitHub token can reach far beyond this project, so it's opt-in. Whatever the
+    # host happens to be logged in with, or has exported, doesn't count.
+    mode = project.config["auth"]["github"]
+    if mode == "gh":
+        return _resolve(provider.name, provider.env, "gh auth token", store)
+    if mode != "stored":
+        raise Fail(f'unknown auth.github value {mode!r}', 'use "stored" or "gh"')
+    return (store[provider.name], "vk auth") if store.get(provider.name) else None
+
+
 def resolve_bindings(project: Project) -> list[Binding]:
     """Every credential that has a value and whose hosts this project may reach."""
     store = _read_store()
@@ -135,7 +148,7 @@ def resolve_bindings(project: Project) -> list[Binding]:
     for provider in BUILTIN:
         if not (presets & set(provider.presets)) and not set(provider.hosts) <= allowed:
             continue
-        found = _resolve(provider.name, provider.env, provider.command, store)
+        found = _resolve_provider(provider, project, store)
         if not found:
             continue
         value, source = found

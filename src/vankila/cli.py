@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import shutil
 import subprocess
 import sys
@@ -14,16 +15,17 @@ from .config import (
     PROJECT_FILE,
     Project,
     add_allowed_host,
-    find_root,
     load_project,
+    project_from_text,
     render_template,
+    write_project_file,
 )
 from .secrets import BUILTIN, delete_secret, resolve_bindings, save_secret
 from .smol import SMOLVM_VERSION, Smol, check_kvm, find_binary
-from .ui import Fail, bold, dim, green, info, ok, red, say, warn, yellow
+from .ui import Fail, bold, clean, dim, green, info, ok, red, say, warn, yellow
 
 HELP = f"""\
-{bold("vk")} runs coding agents in micro-VMs, with your project mounted, egress limited to an
+{bold("vk")} runs coding agents in micro-VMs, with your project mounted, egress filtered by an
 allow list, and secrets that never enter the VM.
 
 {bold("Run things")}
@@ -59,9 +61,7 @@ def _project_for(command: str, directory: str | None) -> Project:
     if command in ("trust", "init", "selftest"):
         # These must work while vankila.toml is unapproved, or even unparseable.
         return load_project(cwd, read_project_file=False)
-    root = find_root(cwd)
-    trust.ensure_trusted(Project(root=root, cwd=cwd, config={}))
-    return load_project(cwd)
+    return trust.load_approved(cwd)
 
 
 def _in_sandbox(project: Project, command: list[str], assume_yes: bool) -> int:
@@ -106,20 +106,24 @@ def cmd_shell(project: Project, argv: list[str], assume_yes: bool) -> int:
 
 def cmd_init(project: Project, argv: list[str], assume_yes: bool) -> int:
     path = project.cwd / PROJECT_FILE
-    if path.exists():
+    if os.path.lexists(path):
         info(f"{path} already exists")
         return 0
-    path.write_text(render_template(project.cwd))
-    trust.record(load_project(project.cwd))
+    text = render_template(project.cwd)
+    write_project_file(project.cwd, text, create=True)
+    trust.record(Project(root=project.cwd, cwd=project.cwd, config={}), text)
     ok(f"Wrote {PROJECT_FILE}")
     return 0
 
 
 def cmd_trust(project: Project, argv: list[str], assume_yes: bool) -> int:
-    if not (project.root / PROJECT_FILE).exists():
-        info(f"No {PROJECT_FILE} here")
+    had_approval = trust.approved_text(project) is not None
+    if trust.ensure_trusted(project, force_prompt=True) is None:
+        if had_approval:
+            ok(f"Accepted the deletion of {PROJECT_FILE}")
+        else:
+            info(f"No {PROJECT_FILE} here")
         return 0
-    trust.ensure_trusted(project, force_prompt=True)
     ok(f"Approved {project.root / PROJECT_FILE}")
     return 0
 
@@ -205,7 +209,7 @@ def cmd_status(project: Project, argv: list[str], assume_yes: bool) -> int:
             say(f"  disk      {_human(usage[0])} on host {dim(f'({_human(usage[1])} provisioned)')}")
     registries = project.config["registries"]
     say(f"  cooldown  {registries['cooldown_days']} days (not cargo: unsupported upstream)")
-    say(bold("Egress allow list") + dim("  (all else denied, private ranges blocked)"))
+    say(bold("Egress allow list") + dim("  (limits accidents, not a determined guest: see the README)"))
     for host in project.allowed_hosts():
         say(f"  {host}")
     return _auth_table(project)
@@ -215,14 +219,20 @@ def cmd_allow(project: Project, argv: list[str], assume_yes: bool) -> int:
     parser = argparse.ArgumentParser(prog="vk allow")
     parser.add_argument("hosts", nargs="+")
     args = parser.parse_args(argv)
+    # Start from the approved text and confirm the file still matches it, so
+    # this can't approve an edit the guest made after the trust check.
+    text = trust.approved_text(project) or ""
+    if (trust.read_project_file(project.root) or "") != text:
+        raise Fail(f"{PROJECT_FILE} changed just now", "review it with `vk trust`, then retry")
     for host in args.hosts:
         if host in project.allowed_hosts():
             info(f"{host} is already allowed")
             continue
-        add_allowed_host(project.root, host)
-        project = load_project(project.cwd)
+        text = add_allowed_host(text, host)
+        project = project_from_text(project.root, project.cwd, text)
         project.allowed_hosts()
-        trust.record(project)
+        write_project_file(project.root, text)
+        trust.record(project, text)
         ok(f"Allowed {host} in {PROJECT_FILE}")
     binary = find_binary()
     if binary:
@@ -241,7 +251,8 @@ def cmd_blocked(project: Project, argv: list[str], assume_yes: bool) -> int:
         return 0
     for event in events:
         when = str(event.get("timestamp", ""))[:19].replace("T", " ")
-        say(f"  {dim(when)}  {event.get('operation', '?'):<8} {event.get('dest', '?')}")
+        # Destinations come from guest traffic, so they aren't safe to print raw.
+        say(f"  {dim(clean(when))}  {clean(str(event.get('operation', '?'))):<8} {clean(str(event.get('dest', '?')))}")
     return 0
 
 
@@ -311,7 +322,9 @@ def cmd_doctor(project: Project, argv: list[str], assume_yes: bool) -> int:
     bindings = {binding.env for binding in resolve_bindings(project)}
     check("Claude Code credential", bool(bindings & {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}), "vk auth claude")
     check("pi credential", bool(bindings & set(PI_CREDENTIAL_ENVS)), "vk auth anthropic (or openai, openrouter, mistral, gemini)")
-    check("GitHub credential", "GH_TOKEN" in bindings, "gh auth login, or vk auth github")
+    # Optional: a GitHub token is only bound when you ask for one.
+    mark = green("✓") if "GH_TOKEN" in bindings else dim("·")
+    say(f"  {mark} GitHub credential" + ("" if "GH_TOKEN" in bindings else f"  {dim('optional: vk auth github')}"))
     return 1 if failures else 0
 
 

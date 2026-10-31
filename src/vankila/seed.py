@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import io
 import json
 import os
@@ -10,7 +11,6 @@ import tarfile
 from pathlib import Path
 
 from .config import Project, config_home, deep_merge
-from .ui import Fail
 
 SETUP_MARKER = "/var/lib/vankila/setup-done"
 
@@ -107,81 +107,6 @@ def setup_script(project: Project) -> str:
     return "set -e\n" + "\n".join(commands) + "\n"
 
 
-def _safe_parent(root: Path, rel: Path) -> Path:
-    """Create `rel`'s parents under `root`, refusing to walk through a symlink.
-
-    Harness directories are guest-writable. A guest could leave a symlink there
-    pointing at a host file, and this code runs on the host.
-    """
-    current = root
-    for part in rel.parts[:-1]:
-        current = current / part
-        try:
-            mode = os.lstat(current).st_mode
-        except FileNotFoundError:
-            current.mkdir()
-            continue
-        if not stat.S_ISDIR(mode):
-            raise Fail(
-                f"unsafe path in sandbox state: {current} is not a plain directory",
-                "something in the sandbox replaced it; inspect it, or run `vk rm --state`",
-            )
-    return current
-
-
-def safe_write(root: Path, rel: str | Path, data: bytes) -> None:
-    rel = Path(rel)
-    if rel.is_absolute() or ".." in rel.parts:
-        raise Fail(f"unsafe harness path: {rel}")
-    parent = _safe_parent(root, rel)
-    tmp = parent / f".vk-tmp-{os.getpid()}-{rel.name}"
-    # O_EXCL refuses a planted symlink at the temp name; rename replaces, never follows.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-    os.replace(tmp, parent / rel.name)
-
-
-def safe_read_json(root: Path, rel: str) -> dict:
-    """Read guest-writable JSON. Anything suspicious counts as empty."""
-    try:
-        fd = os.open(root / rel, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return {}
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            return {}
-        try:
-            data = json.loads(handle.read(16 * 1024 * 1024))
-        except ValueError:
-            return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _overlay_dir(source: Path, target: Path) -> None:
-    """Copy a host-side harness overlay (CLAUDE.md, skills, agents) into state."""
-    # Project overlays are guest-writable. Following a symlink here would copy
-    # host files such as ~/.ssh/id_ed25519 into the guest.
-    if source.is_symlink() or not source.is_dir():
-        return
-    for directory, subdirs, names in os.walk(source, followlinks=False):
-        subdirs[:] = [name for name in subdirs if not (Path(directory) / name).is_symlink()]
-        for name in names:
-            path = Path(directory) / name
-            if not stat.S_ISREG(os.lstat(path).st_mode):
-                continue
-            safe_write(target, path.relative_to(source), path.read_bytes())
-
-
-def _overlay_project(project: Project, harness: str, target: Path) -> None:
-    current = project.root
-    for part in (".vankila", "harness"):
-        current = current / part
-        if current.is_symlink():
-            return
-    _overlay_dir(current / harness, target)
-
-
 def claude_settings(project: Project) -> dict:
     defaults = {
         "env": {
@@ -197,47 +122,54 @@ def pi_settings(project: Project) -> dict:
     return dict(project.config["harness"]["pi"]["settings"])
 
 
-def write_harness_state(project: Project) -> None:
-    """Lay down harness config. Global overlays first, project overlays win."""
-    state = project.state_dir
-    claude, pi = state / "claude", state / "pi"
-    for directory in (claude, pi / "agent"):
-        directory.mkdir(parents=True, exist_ok=True)
-    _overlay_dir(config_home() / "harness" / "claude", claude)
-    _overlay_project(project, "claude", claude)
-    _overlay_dir(config_home() / "harness" / "pi", pi / "agent")
-    _overlay_project(project, "pi", pi / "agent")
-
-    settings = deep_merge(safe_read_json(claude, "settings.json"), claude_settings(project))
-    safe_write(claude, "settings.json", json.dumps(settings, indent=2).encode() + b"\n")
-
-    wanted = pi_settings(project)
-    if wanted:
-        merged = deep_merge(safe_read_json(pi / "agent", "settings.json"), wanted)
-        safe_write(pi / "agent", "settings.json", json.dumps(merged, indent=2).encode() + b"\n")
+# Staged in a fresh directory as guest root, then applied there. See apply_harness.py.
+APPLY_HARNESS_COMMAND = """\
+set -e
+staging="$(mktemp -d)"
+trap 'rm -rf "$staging"' EXIT
+tar -xf - -C "$staging" --no-same-owner
+python3 -I "$staging/apply_harness.py" "$staging"
+"""
 
 
-def write_claude_state(project: Project, api_key_placeholder: str | None) -> None:
-    """Skip Claude Code's first-run screens: the login, trust and API key prompts."""
-    claude = project.state_dir / "claude"
-    state = safe_read_json(claude, ".claude.json")
-    state["hasCompletedOnboarding"] = True
-    state["bypassPermissionsModeAccepted"] = True
-    projects = state.get("projects")
-    projects = projects if isinstance(projects, dict) else {}
-    for guest_dir in {project.guest_root, project.workdir}:
-        entry = projects.get(guest_dir)
-        entry = entry if isinstance(entry, dict) else {}
-        entry["hasTrustDialogAccepted"] = True
-        projects[guest_dir] = entry
-    state["projects"] = projects
-    if api_key_placeholder:
-        responses = state.get("customApiKeyResponses")
-        responses = responses if isinstance(responses, dict) else {}
-        approved = responses.get("approved")
-        approved = approved if isinstance(approved, list) else []
-        suffix = api_key_placeholder[-20:]
-        if suffix not in approved:
-            approved.append(suffix)
-        state["customApiKeyResponses"] = {"approved": approved, "rejected": []}
-    safe_write(claude, ".claude.json", json.dumps(state, indent=2).encode() + b"\n")
+def _add_file(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = 0o644
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _add_global_overlay(tar: tarfile.TarFile, harness: str) -> None:
+    """The global overlay is the user's own, outside anything the guest can write."""
+    source = config_home() / "harness" / harness
+    if source.is_symlink() or not source.is_dir():
+        return
+    for directory, subdirs, names in os.walk(source, followlinks=False):
+        subdirs[:] = [name for name in subdirs if not (Path(directory) / name).is_symlink()]
+        for name in names:
+            path = Path(directory) / name
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                _add_file(tar, f"global/{harness}/{path.relative_to(source).as_posix()}", path.read_bytes())
+
+
+def harness_tar(project: Project, api_key_placeholder: str | None, uid: int, gid: int) -> bytes:
+    """Everything the guest needs to lay down its own harness config."""
+    payload = {
+        "uid": uid,
+        "gid": gid,
+        "claude_dir": "/home/agent/.claude",
+        "pi_dir": "/home/agent/.pi",
+        "project_root": project.guest_root,
+        "claude_settings": claude_settings(project),
+        "pi_settings": pi_settings(project),
+        "trusted_dirs": sorted({project.guest_root, project.workdir}),
+        "api_key": api_key_placeholder,
+    }
+    script = (importlib.resources.files("vankila") / "assets" / "apply_harness.py").read_bytes()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        _add_file(tar, "apply_harness.py", script)
+        _add_file(tar, "payload.json", json.dumps(payload).encode())
+        _add_global_overlay(tar, "claude")
+        _add_global_overlay(tar, "pi")
+    return buffer.getvalue()

@@ -13,8 +13,9 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+from . import confine
 from .config import data_home
-from .ui import Fail, Spinner, confirm, dim, ok, say
+from .ui import Fail, Spinner, confirm, dim, ok, say, warn
 
 SMOLVM_VERSION = "1.32.4"
 RELEASES = "https://github.com/smol-machines/smolvm/releases/download"
@@ -25,6 +26,12 @@ SMOLVM_SHA256 = {
     "arm64": "693b34530d9eac9d6d1b61e22b33bb34c87c511b1a8c9098fe35d9c4a77e07ce",
 }
 
+
+# What smolvm needs read-only, beyond the mounts. Deliberately not home.
+VMM_READ_ONLY = ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/sys")
+VMM_READ_WRITE = ("/dev/kvm", "/dev/net/tun", "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random",
+                  "/dev/ptmx", "/dev/pts")
+NO_CONFINE_ENV = "VANKILA_NO_CONFINE"
 
 INSTALL_HINT = "put smolvm on your PATH, or set VANKILA_SMOLVM: https://smolmachines.com/docs/local"
 
@@ -145,6 +152,32 @@ class Smol:
             message = proc.stderr.decode(errors="replace").strip() or "no error output"
             raise Fail(f"smolvm {' '.join(args[:2])} failed: {message}")
         return proc
+
+    def start(self, name: str, env: dict[str, str], read_write: list[str], read_only: list[str]) -> None:
+        """Start the VM with its process limited to the given host paths, where the kernel allows."""
+        args = ("machine", "start", "--name", name)
+        if os.environ.get(NO_CONFINE_ENV):
+            warn(f"The VM process is not confined: {NO_CONFINE_ENV} is set.")
+            self.run(*args, env=env)
+            return
+        if confine.abi_version() < 1:
+            warn("The VM process is not confined: this kernel doesn't have Landlock enabled.")
+            self.run(*args, env=env)
+            return
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser()
+        spec = {
+            "read_only": [*VMM_READ_ONLY, str(Path(self.binary).resolve().parent), *read_only],
+            "read_write": [*VMM_READ_WRITE, str(data_home()), str(data_home().parent / "smolvm"),
+                           str(cache_home / "smolvm"), *read_write],
+        }
+        proc = subprocess.run(
+            confine.wrapper_command(spec, [self.binary, *args]),
+            env={**os.environ, **env}, capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            message = proc.stderr.decode(errors="replace").strip() or "no error output"
+            raise Fail(f"smolvm machine start failed: {message}",
+                       f"if the confinement is the cause, {NO_CONFINE_ENV}=1 turns it off")
 
     def status(self, name: str) -> dict | None:
         proc = self.run("machine", "status", "--name", name, "--json", check=False)

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import os
 import secrets as pysecrets
 import shutil
+import socket
 import tempfile
 from pathlib import Path
 
-from . import sandbox, trust
+from . import confine, image, sandbox, trust
 from .config import load_project
 from .smol import Smol
-from .ui import bold, dim, green, red, say
+from .ui import Fail, bold, dim, green, red, say, yellow
 
 ECHO_HOST = "httpbingo.org"
 UNBOUND_ECHO_HOST = "postman-echo.com"
@@ -30,22 +30,57 @@ TOOLS = {
 }
 
 
+# Sends one DNS query for example.com, straight to a public resolver.
+DNS_QUERY = (
+    "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(5);"
+    r"s.sendto(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01',"
+    "('1.1.1.1',53));print(len(s.recv(512)))"
+)
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _listening_addresses(port: int) -> set[str]:
+    """Local addresses with a listener on this TCP port, from /proc/net (hex, as the kernel prints)."""
+    found = set()
+    for name in ("tcp", "tcp6"):
+        for line in Path(f"/proc/net/{name}").read_text().splitlines()[1:]:
+            fields = line.split()
+            address, _, hex_port = fields[1].partition(":")
+            if fields[3] == "0A" and int(hex_port, 16) == port:
+                found.add(address)
+    return found
+
+
+LOOPBACK_ADDRESSES = {"0100007F", "00000000000000000000000001000000"}
+
+
 def run() -> int:
     # Under home, not /tmp: it must be a directory smolvm can share with the guest.
     cache = Path.home() / ".cache"
     cache.mkdir(exist_ok=True)
     project_dir = Path(tempfile.mkdtemp(prefix="vk-selftest-", dir=cache))
+    canary = Path(tempfile.mkdtemp(prefix="vk-selftest-canary-", dir=cache))
+    published_port = _free_port()
     token = "vk-dummy-" + pysecrets.token_hex(16)
     env_names = {"VK_TEST_TOKEN": token, "VK_TEST_API_KEY": token, "VK_TEST_HEADER": f"Bearer {token}"}
     saved = {name: os.environ.get(name) for name in env_names}
     os.environ.update(env_names)
-    (project_dir / "vankila.toml").write_text(f"""\
+    config_text = f"""\
 [network]
 presets = ["npm"]
 allow = ["{ECHO_HOST}", "{UNBOUND_ECHO_HOST}"]
 
 [sandbox]
 setup = ["touch /tmp/setup-ran"]
+ports = ["{published_port}:8000"]
+
+[harness.pi]
+settings = {{ defaultProvider = "selftest" }}
 
 [credentials.bearer]
 env = "VK_TEST_TOKEN"
@@ -54,9 +89,10 @@ hosts = ["{ECHO_HOST}"]
 [credentials.apikey]
 env = "VK_TEST_API_KEY"
 hosts = ["{ECHO_HOST}"]
-""")
+"""
+    (project_dir / "vankila.toml").write_text(config_text)
     project = load_project(project_dir)
-    trust.record(project)
+    trust.record(project, config_text)
     smol = Smol()
     results: list[bool] = []
 
@@ -64,6 +100,13 @@ hosts = ["{ECHO_HOST}"]
         results.append(passed)
         mark = green("✓") if passed else red("✗")
         say(f"  {mark} {label}" + (f"  {dim(detail[:200])}" if detail and not passed else ""))
+
+    def known(label: str, leaks: bool) -> None:
+        """A documented weakness. It isn't a failure, but a change in it should be noticed."""
+        if leaks:
+            say(f"  {yellow('!')} known weakness: {label}")
+        else:
+            say(f"  {green('✓')} no longer happens, so the README is out of date: {label}")
 
     def guest(script: str, stdin: bytes | None = None) -> tuple[int, str]:
         args = ["machine", "exec", "--name", project.machine, "--user", "agent",
@@ -79,7 +122,7 @@ hosts = ["{ECHO_HOST}"]
 
     try:
         say(bold("Boot"))
-        sandbox.ensure_running(smol, project, assume_yes=True)
+        bindings = sandbox.ensure_running(smol, project, assume_yes=True)
         status = smol.status(project.machine) or {}
         check("sandbox is running", status.get("state") == "running", str(status.get("state")))
 
@@ -134,6 +177,55 @@ hosts = ["{ECHO_HOST}"]
         check("git works in the mount", code == 0, out)
         check("project setup ran", guest("test -e /tmp/setup-ran")[0] == 0)
 
+        say(bold("Escapes"))
+        guest("mkdir -p .vankila/harness/pi && echo planted > .vankila/harness/pi/.bashrc")
+        guest(f"rm -rf ~/.pi/agent && ln -s {canary} ~/.pi/agent")
+        planted = (project.state_dir / "pi" / "agent").is_symlink()
+        check("a guest can plant a link in harness state", planted)
+        sandbox.ensure_running(smol, project, assume_yes=True)
+        check("vk doesn't follow a planted link onto the host", not list(canary.iterdir()),
+              str(list(canary.iterdir())))
+        check("the link resolves inside the guest", guest("test -e ~/.pi/agent/.bashrc")[0] == 0)
+        guest(f"rm -f ~/.pi/agent && rm -rf {canary}")
+        code, out = guest("sudo mknod selftest-device b 8 0")
+        check("guest root can't reach host devices through the mount", code != 0, out)
+        guest("sudo install -m 4755 /bin/true selftest-setuid")
+        setuid = project_dir / "selftest-setuid"
+        check("a guest setuid file grants nothing on the host",
+              not setuid.exists() or setuid.stat().st_uid == os.getuid())
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.setblocking(False)
+            port = listener.getsockname()[1]
+            guest(f"curl -sS -m 5 http://100.96.0.1:{port}/ -o /dev/null")
+            try:
+                listener.accept()
+                reached = True
+            except BlockingIOError:
+                reached = False
+        check("the host's loopback is out of reach", not reached)
+        code, out = guest("curl -sS -m 5 https://1.1.1.1/ -o /dev/null")
+        check("an unlisted IP is blocked", code != 0, out)
+        code, out = guest("curl -sS -m 5 -6 'https://[2606:4700:4700::1111]/' -o /dev/null")
+        check("an unlisted IPv6 address is blocked", code != 0, out)
+        addresses = _listening_addresses(published_port)
+        check("published ports bind only to loopback", bool(addresses) and addresses <= LOOPBACK_ADDRESSES,
+              str(addresses))
+
+        say(bold("Known egress weaknesses"))
+        code, out = guest(f"python3 -c \"{DNS_QUERY}\"")
+        known("DNS reaches a public resolver over UDP", code == 0)
+        code, _ = guest("timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'")
+        known("DNS reaches a public resolver over TCP", code == 0)
+        code, out = guest(
+            "ip=$(getent hosts registry.npmjs.org | awk '{print $1; exit}'); "
+            "curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve example.com:443:$ip https://example.com/"
+        )
+        known("an unlisted site is reachable through an allowed host's CDN address", out == "200")
+        code, _ = guest("timeout 5 bash -c 'exec 3<>/dev/tcp/registry.npmjs.org/8443'")
+        known("any port on an allowed host's address connects", code == 0)
+
         say(bold("Lifecycle"))
         guest("touch /home/agent/persisted")
         smol.stop(project.machine)
@@ -141,13 +233,31 @@ hosts = ["{ECHO_HOST}"]
         check("state survives a restart", guest("test -e /home/agent/persisted")[0] == 0)
         _, after = guest("printenv VK_TEST_TOKEN")
         check("placeholder is stable across restarts", after == placeholder, after)
-        settings = project.state_dir / "claude" / "settings.json"
-        check("harness config is in place", "DISABLE_AUTOUPDATER" in json.dumps(json.loads(settings.read_text())))
+        check("harness config is in place", "DISABLE_AUTOUPDATER" in guest("cat /home/agent/.claude/settings.json")[1])
+
+        say(bold("VM process confinement"))
+        if confine.abi_version() < 1:
+            say(f"  {yellow('!')} this kernel doesn't have Landlock enabled, so the VM process isn't confined")
+        else:
+            # The real proof it applies to the VM process, not just to `machine start`:
+            # withhold the project from the rules, and the guest must lose it.
+            smol.stop(project.machine)
+            state = [str(project.state_dir / "claude"), str(project.state_dir / "pi")]
+            marker = project_dir / "confinement-marker"
+            try:
+                smol.start(project.machine, sandbox._start_env(bindings), state,
+                           [str(image.image_dir(project.config["tools"]))])
+                code, out = guest("echo reached > confinement-marker")
+            except Fail as err:
+                code, out = 1, str(err)
+            check("the VM process can't reach a path it wasn't granted", code != 0 and not marker.exists(), out)
     finally:
         smol.stop(project.machine)
         smol.delete(project.machine)
         shutil.rmtree(project.state_dir, ignore_errors=True)
+        trust.forget(project)
         shutil.rmtree(project_dir, ignore_errors=True)
+        shutil.rmtree(canary, ignore_errors=True)
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)

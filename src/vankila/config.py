@@ -6,6 +6,7 @@ import copy
 import hashlib
 import os
 import re
+import secrets
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ DEFAULTS: dict = {
         "setup": [],
         "ssh_agent": False,
         "keep_running": False,
+        "snapshot": False,
     },
     "network": {
         "presets": ["claude", "github", "npm", "pypi", "crates", "rust", "apt"],
@@ -66,6 +68,8 @@ DEFAULTS: dict = {
     "auth": {
         # Which credential Claude Code uses when both are configured.
         "claude": "oauth",
+        # "stored": only a token from `vk auth github`. "gh": also $GH_TOKEN and `gh auth token`.
+        "github": "stored",
     },
     "credentials": {},
     "harness": {
@@ -105,10 +109,17 @@ def deep_merge(base: dict, over: dict) -> dict:
 
 def _load(path: Path) -> dict:
     try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
+        text = path.read_bytes().decode()
     except FileNotFoundError:
         return {}
+    except UnicodeDecodeError as err:
+        raise Fail(f"{path}: {err}") from err
+    return parse_config(text, path)
+
+
+def parse_config(text: str, path: Path) -> dict:
+    try:
+        data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as err:
         raise Fail(f"{path}: {err}") from err
     unknown = set(data) - SCHEMA_SECTIONS
@@ -199,25 +210,60 @@ def load_global() -> dict:
 
 
 def load_project(cwd: Path | None = None, read_project_file: bool = True) -> Project:
+    """Load a project from disk, with no approval check. Use trust.load_approved to act on one."""
     cwd = (cwd or Path.cwd()).resolve()
     root = find_root(cwd)
+    return _build_project(root, cwd, _load(root / PROJECT_FILE) if read_project_file else {})
+
+
+def project_from_text(root: Path, cwd: Path, text: str | None) -> Project:
+    """Build a project from bytes already in hand, so nothing is read a second time."""
+    return _build_project(root, cwd, {} if text is None else parse_config(text, root / PROJECT_FILE))
+
+
+def _build_project(root: Path, cwd: Path, project_config: dict) -> Project:
     global_config = load_global()
     merged = deep_merge(copy.deepcopy(DEFAULTS), global_config)
-    if read_project_file:
-        merged = deep_merge(merged, _load(root / PROJECT_FILE))
+    merged = deep_merge(merged, project_config)
     # Lists normally replace, but a global allow must survive a project's `allow = []`.
     global_allow = global_config.get("network", {}).get("allow", [])
     merged["network"]["allow"] = list(dict.fromkeys([*global_allow, *merged["network"]["allow"]]))
     return Project(root=root, cwd=cwd, config=merged)
 
 
+# Relative to home. A mount here would hand the guest credentials or code the host runs.
+SENSITIVE_HOME_PATHS = (
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".local", ".claude",
+    ".password-store", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".gitconfig",
+    ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zshenv", ".zprofile",
+)
+SENSITIVE_SYSTEM_PATHS = ("/etc", "/root", "/boot", "/proc", "/sys", "/dev", "/run", "/usr", "/var")
+
+
+def _overlaps(path: Path, sensitive: Path) -> bool:
+    return path == sensitive or sensitive in path.parents or path in sensitive.parents
+
+
 def check_mountable(root: Path) -> None:
+    """`root` must already be resolved."""
     home = Path.home().resolve()
     if root == Path("/") or root == home or root in home.parents:
         raise Fail(
             f"refusing to mount {root} into a sandbox: it holds your credentials and dotfiles",
             "cd into a project directory, or `vk init` one",
         )
+    sensitive = [home / name for name in SENSITIVE_HOME_PATHS]
+    sensitive += [path.resolve() for path in (config_home(), data_home(), state_home())]
+    # Home can itself live under one of these, as with /var/home on some distros.
+    if home not in root.parents:
+        sensitive += [Path(path).resolve() for path in SENSITIVE_SYSTEM_PATHS]
+    for path in sensitive:
+        if _overlaps(root, path):
+            raise Fail(
+                f"refusing to mount {root} into a sandbox: it overlaps {path}, "
+                "which can hold credentials or code your host runs",
+                "mount a directory that holds only what the sandbox needs",
+            )
 
 
 def detect_presets(root: Path) -> list[str]:
@@ -259,10 +305,8 @@ ignore_scripts = true          # npm-family install scripts
 """
 
 
-def add_allowed_host(root: Path, host: str) -> None:
+def add_allowed_host(text: str, host: str) -> str:
     """Add a host to [network].allow, keeping the file's comments intact."""
-    path = root / PROJECT_FILE
-    text = path.read_text() if path.exists() else ""
     allow = re.search(r"^(allow\s*=\s*\[)(.*?)(\])", text, flags=re.M | re.S)
     if allow and "[network]" in text[: allow.start()]:
         body = allow.group(2).strip().rstrip(",")
@@ -272,4 +316,25 @@ def add_allowed_host(root: Path, host: str) -> None:
         text = text.replace("[network]", f'[network]\nallow = ["{host}"]', 1)
     else:
         text = f'{text.rstrip()}\n\n[network]\nallow = ["{host}"]\n'.lstrip()
-    path.write_text(text)
+    return text
+
+
+def write_project_file(root: Path, text: str, *, create: bool = False) -> None:
+    """The project directory is guest-writable, so never write through what's there.
+
+    `create` refuses anything already at the path, including a dangling symlink.
+    Otherwise the file is replaced by rename, which doesn't follow a symlink either.
+    """
+    path = root / PROJECT_FILE
+    if create:
+        target = path
+    else:
+        target = root / f".{PROJECT_FILE}.{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
+        raise Fail(f"{target} already exists: refusing to write through it") from None
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    if not create:
+        os.replace(target, path)

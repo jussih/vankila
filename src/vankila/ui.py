@@ -7,6 +7,23 @@ import os
 import sys
 import threading
 import time
+import unicodedata
+
+
+def clean(text: str) -> str:
+    """Make untrusted text safe to print: control and invisible characters become visible.
+
+    Covers terminal escapes (OSC 52 can write the clipboard) and bidi overrides,
+    which can make a line display differently from what it really says.
+    """
+    out = []
+    for char in text:
+        if char != "\t" and unicodedata.category(char) in ("Cc", "Cf", "Zl", "Zp"):
+            code = ord(char)
+            out.append(f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def _color(code: str, text: str) -> str:
