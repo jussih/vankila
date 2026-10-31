@@ -13,6 +13,11 @@ $ vk claude          # that's it
 The first run builds the image, which takes a few minutes. After that a sandbox boots in about a
 second.
 
+## Use of AI
+
+The project is built using Claude Opus 5.5. The sandbox was implementated and then audited and reviewed
+by the same model.
+
 ## Install
 
 Needs Linux with KVM (`/dev/kvm`), and Python 3.11+.
@@ -63,7 +68,8 @@ stops when the last one exits, and tells you if anything was blocked along the w
 No config is required. `vk init` writes a starter file with presets detected from your project.
 Settings merge in this order: built-in defaults, `~/.config/vankila/config.toml`, then the project's
 `vankila.toml`. A later value replaces an earlier one, including lists, with one exception: hosts in
-the global `network.allow` always apply, in addition to the project's.
+the global `network.allow` always apply, in addition to the project's. See the
+[configuration reference](docs/configuration.md) for every option and where each file lives.
 
 ```toml
 [network]
@@ -75,8 +81,8 @@ allow_private = ["10.20.0.0/16"]        # e.g. an internal registry
 [sandbox]
 cpus = 4
 memory = 8192                           # MiB; a cap, only touched memory is used
-overlay = 20                            # GiB, for the VM's filesystem changes
-storage = 20                            # GiB
+overlay = 20                            # GiB, persistent root filesystem changes (packages, caches)
+storage = 20                            # GiB, image layers and container data
 ports = ["3000", "8080:80"]
 mounts = ["../shared-lib:/workspace/shared-lib:ro"]
 env = { RUST_BACKTRACE = "1" }

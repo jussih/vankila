@@ -85,6 +85,11 @@ ones and prints them as `known weakness`, so a smolvm upgrade that changes them 
   on `sandbox.snapshot` for a copy to go back to. Snapshots aren't taken while the VM is already running,
   and `vk rm --state` deletes them.
 - **`.env` files are visible.** Anything in the project directory is readable in the guest.
+- **In-repo harness config isn't approved.** `vk trust` covers only `vankila.toml`. Files in
+  `.vankila/harness/` can come from a cloned repo or the agent, and are copied into the guest's harness
+  config on every run with no prompt. That includes instructions and hooks, which run in the guest and
+  can use its bound credentials and allowed hosts. Check that directory before running `vk` in a repo you
+  don't trust.
 
 These let guest changes affect your host later, or use up its resources:
 
