@@ -15,8 +15,33 @@ second.
 
 ## Use of AI
 
-The project is built using Claude Opus 5.5. The sandbox was implementated and then audited and reviewed
-by the same model.
+The project is built using Claude Opus 5.5. The sandbox was implemented and then audited and reviewed
+by the same model. Bulk of the functionality comes from SmolVM, this project is a configuration wrapper and
+user interface.
+
+## Sandbox model
+
+```mermaid
+flowchart TB
+    subgraph HOST["Host"]
+        PROJ[("Project + sessions")]
+        SECRETS[("Real credentials")]
+        EGRESS{{"Egress boundary<br/>allow list + token injection"}}
+        subgraph VM["smolvm virtual machine"]
+            HARNESS["Agent harness<br/>Claude Code / pi"]
+        end
+        SECRETS -.-> EGRESS
+        PROJ <--> HARNESS
+        HARNESS --> EGRESS
+    end
+
+    NET(("Internet"))
+    EGRESS -->|allowed hosts only| NET
+```
+
+Everything the agent does happens inside the VM. Its only way out is through the host-side egress
+boundary, which filters by allow list and swaps placeholders for real tokens on the way to the listed
+hosts. See [SANDBOX.md](SANDBOX.md) for what this does and doesn't stop.
 
 ## Install
 
