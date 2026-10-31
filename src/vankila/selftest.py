@@ -30,11 +30,11 @@ TOOLS = {
 }
 
 
-# Sends one DNS query for example.com, straight to a public resolver.
+# Sends one DNS query for example.com to a public resolver, and prints the answer count.
 DNS_QUERY = (
     "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(5);"
     r"s.sendto(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01',"
-    "('1.1.1.1',53));print(len(s.recv(512)))"
+    "('1.1.1.1',53));r=s.recv(512);print(r[6]*256+r[7])"
 )
 
 
@@ -209,15 +209,14 @@ hosts = ["{ECHO_HOST}"]
         check("an unlisted IP is blocked", code != 0, out)
         code, out = guest("curl -sS -m 5 -6 'https://[2606:4700:4700::1111]/' -o /dev/null")
         check("an unlisted IPv6 address is blocked", code != 0, out)
+        # smolvm answers port 53 itself, so a reply isn't a leak. An answer for this name would be.
+        code, out = guest(f"python3 -c \"{DNS_QUERY}\"")
+        check("a public resolver gives no answer for an unlisted name", code != 0 or out == "0", out)
         addresses = _listening_addresses(published_port)
         check("published ports bind only to loopback", bool(addresses) and addresses <= LOOPBACK_ADDRESSES,
               str(addresses))
 
         say(bold("Known egress weaknesses"))
-        code, out = guest(f"python3 -c \"{DNS_QUERY}\"")
-        known("DNS reaches a public resolver over UDP", code == 0)
-        code, _ = guest("timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'")
-        known("DNS reaches a public resolver over TCP", code == 0)
         code, out = guest(
             "ip=$(getent hosts registry.npmjs.org | awk '{print $1; exit}'); "
             "curl -sS -m 10 -o /dev/null -w '%{http_code}' --resolve example.com:443:$ip https://example.com/"
